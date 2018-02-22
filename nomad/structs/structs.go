@@ -2656,7 +2656,8 @@ type ReschedulePolicy struct {
 	// DelayCeiling is an upper bound on the delay.
 	DelayCeiling time.Duration
 
-	// Unlimited allows rescheduling attempts until they succeed
+	// Unlimited allows infinite rescheduling attempts. Only allowed when delay is set between reschedule
+	// attempts.
 	Unlimited bool
 }
 
@@ -2707,7 +2708,7 @@ func (r *ReschedulePolicy) Validate() error {
 
 	}
 
-	// Validate Interval and other delay parameters if attempts are limited
+	//Validate Interval and other delay parameters if attempts are limited
 	if !r.Unlimited {
 		if r.Interval.Nanoseconds() < ReschedulePolicyMinInterval.Nanoseconds() {
 			multierror.Append(&mErr, fmt.Errorf("Interval cannot be less than %v (got %v)", ReschedulePolicyMinInterval, r.Interval))
