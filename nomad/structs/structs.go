@@ -5121,6 +5121,9 @@ type RescheduleEvent struct {
 
 	// PrevNodeID is the node ID of the previous allocation
 	PrevNodeID string
+
+	// Delay is the reschedule delay associated with the attempt
+	Delay time.Duration
 }
 
 func NewRescheduleEvent(rescheduleTime int64, prevAllocID string, prevNodeID string) *RescheduleEvent {
@@ -5345,11 +5348,11 @@ func (a *Allocation) RescheduleEligible(reschedulePolicy *ReschedulePolicy, fail
 	}
 	attempts := reschedulePolicy.Attempts
 	interval := reschedulePolicy.Interval
-
-	if attempts == 0 {
+	enabled := attempts > 0 || reschedulePolicy.Unlimited
+	if !enabled {
 		return false
 	}
-	if (a.RescheduleTracker == nil || len(a.RescheduleTracker.Events) == 0) && attempts > 0 {
+	if (a.RescheduleTracker == nil || len(a.RescheduleTracker.Events) == 0) && attempts > 0 || reschedulePolicy.Unlimited {
 		return true
 	}
 	attempted := 0
@@ -5361,6 +5364,84 @@ func (a *Allocation) RescheduleEligible(reschedulePolicy *ReschedulePolicy, fail
 		}
 	}
 	return attempted < attempts
+}
+
+// LastEventTime is the time of the last task event in the allocation.
+// It is used to determine allocation failure time.
+func (a *Allocation) LastEventTime() time.Time {
+	var lastEventTime time.Time
+	if a.TaskStates != nil {
+		for _, e := range a.TaskStates {
+			if lastEventTime.IsZero() || e.FinishedAt.After(lastEventTime) {
+				lastEventTime = e.FinishedAt
+			}
+		}
+	}
+	return lastEventTime
+}
+
+// NextRescheduleDuration returns a time delta after which the allocation is eligible to be rescheduled
+// and whether the next reschedule time is within policy's interval if the policy doesn't allow unlimited reschedules
+func (a *Allocation) NextRescheduleDuration(reschedulePolicy *ReschedulePolicy) (time.Time, bool) {
+	failTime := a.LastEventTime()
+	if a.ClientStatus != AllocClientStatusFailed || failTime.IsZero() {
+		return time.Time{}, false
+	}
+	nextDelay := a.NextDelay(reschedulePolicy)
+	nextRescheduleTime := failTime.Add(nextDelay)
+	rescheduleEligible := reschedulePolicy.Unlimited
+	if reschedulePolicy.Attempts > 0 {
+		// Check for eligibility based on the interval if max attempts is set
+		attempted := 0
+		for j := len(a.RescheduleTracker.Events) - 1; j >= 0; j-- {
+			lastAttempt := a.RescheduleTracker.Events[j].RescheduleTime
+			timeDiff := failTime.UTC().UnixNano() - lastAttempt
+			if timeDiff < reschedulePolicy.Interval.Nanoseconds() {
+				attempted += 1
+			}
+		}
+		rescheduleEligible = attempted < reschedulePolicy.Attempts && nextDelay < reschedulePolicy.Interval
+	}
+	return nextRescheduleTime, rescheduleEligible
+}
+
+func (a *Allocation) NextDelay(policy *ReschedulePolicy) time.Duration {
+	delayDur := policy.Delay
+	if a.RescheduleTracker == nil || a.RescheduleTracker.Events == nil || len(a.RescheduleTracker.Events) == 0 {
+		return delayDur
+	}
+	events := a.RescheduleTracker.Events
+	switch policy.DelayFunction {
+	case "exponential":
+		delayDur = a.RescheduleTracker.Events[len(a.RescheduleTracker.Events)-1].Delay * 2
+	case "fibonacci":
+		if len(events) >= 2 {
+			fibN1Delay := events[len(events)-1].Delay
+			fibN2Delay := events[len(events)-2].Delay
+			// Handle reset of delay ceiling which should cause
+			// a new series to start
+			if fibN2Delay == policy.DelayCeiling && fibN1Delay == policy.Delay {
+				delayDur = fibN1Delay
+			} else {
+				delayDur = fibN1Delay + fibN2Delay
+			}
+		}
+	default:
+		return delayDur
+	}
+	if delayDur > policy.DelayCeiling {
+		delayDur = policy.DelayCeiling
+		// check if delay needs to be reset
+		if len(a.RescheduleTracker.Events) > 0 {
+			lastRescheduleEvent := a.RescheduleTracker.Events[len(a.RescheduleTracker.Events)-1]
+			timeDiff := a.LastEventTime().UTC().UnixNano() - lastRescheduleEvent.RescheduleTime
+			if timeDiff > delayDur.Nanoseconds() {
+				delayDur = policy.Delay
+			}
+		}
+	}
+
+	return delayDur
 }
 
 // Terminated returns if the allocation is in a terminal state on a client.
@@ -5754,6 +5835,10 @@ type Evaluation struct {
 	// Wait is a minimum wait time for running the eval. This is used to
 	// support a rolling upgrade.
 	Wait time.Duration
+
+	// WaitUntil is the time when this eval should be run. This is used to
+	// supported delayed rescheduling of failed allocations
+	WaitUntil time.Duration
 
 	// NextEval is the evaluation ID for the eval created to do a followup.
 	// This is used to support rolling upgrades, where we need a chain of evaluations.
