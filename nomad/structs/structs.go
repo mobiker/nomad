@@ -5225,6 +5225,13 @@ type Allocation struct {
 	// given deployment
 	DeploymentStatus *AllocDeploymentStatus
 
+	// RescheduleTrackers captures details of previous reschedule attempts of the allocation
+	RescheduleTracker *RescheduleTracker
+
+	// FollowupEvalID captures a follow up evaluation created to handle a failed allocation
+	// that can be rescheduled in the future
+	FollowupEvalID string
+
 	// Raft Indexes
 	CreateIndex uint64
 	ModifyIndex uint64
@@ -5239,9 +5246,6 @@ type Allocation struct {
 
 	// ModifyTime is the time the allocation was last updated.
 	ModifyTime int64
-
-	// RescheduleTrackers captures details of previous reschedule attempts of the allocation
-	RescheduleTracker *RescheduleTracker
 }
 
 // Index returns the index of the allocation. If the allocation is from a task
@@ -5380,17 +5384,17 @@ func (a *Allocation) LastEventTime() time.Time {
 	return lastEventTime
 }
 
-// NextRescheduleDuration returns a time delta after which the allocation is eligible to be rescheduled
+// NextRescheduleTime returns a time delta after which the allocation is eligible to be rescheduled
 // and whether the next reschedule time is within policy's interval if the policy doesn't allow unlimited reschedules
-func (a *Allocation) NextRescheduleDuration(reschedulePolicy *ReschedulePolicy) (time.Time, bool) {
+func (a *Allocation) NextRescheduleTime(reschedulePolicy *ReschedulePolicy) (time.Time, bool) {
 	failTime := a.LastEventTime()
 	if a.ClientStatus != AllocClientStatusFailed || failTime.IsZero() {
 		return time.Time{}, false
 	}
 	nextDelay := a.NextDelay(reschedulePolicy)
 	nextRescheduleTime := failTime.Add(nextDelay)
-	rescheduleEligible := reschedulePolicy.Unlimited
-	if reschedulePolicy.Attempts > 0 {
+	rescheduleEligible := reschedulePolicy.Unlimited || (reschedulePolicy.Attempts > 0 && a.RescheduleTracker == nil)
+	if reschedulePolicy.Attempts > 0 && a.RescheduleTracker != nil && a.RescheduleTracker.Events != nil {
 		// Check for eligibility based on the interval if max attempts is set
 		attempted := 0
 		for j := len(a.RescheduleTracker.Events) - 1; j >= 0; j-- {
@@ -5548,10 +5552,12 @@ type AllocListStub struct {
 	ClientDescription  string
 	TaskStates         map[string]*TaskState
 	DeploymentStatus   *AllocDeploymentStatus
-	CreateIndex        uint64
-	ModifyIndex        uint64
-	CreateTime         int64
-	ModifyTime         int64
+
+	FollowupEvalID string
+	CreateIndex    uint64
+	ModifyIndex    uint64
+	CreateTime     int64
+	ModifyTime     int64
 }
 
 // SetEventDisplayMessage populates the display message if its not already set,
@@ -5833,12 +5839,13 @@ type Evaluation struct {
 	StatusDescription string
 
 	// Wait is a minimum wait time for running the eval. This is used to
-	// support a rolling upgrade.
+	// support a rolling upgrade in versions prior to 0.7.0
+	// Deprecated
 	Wait time.Duration
 
 	// WaitUntil is the time when this eval should be run. This is used to
 	// supported delayed rescheduling of failed allocations
-	WaitUntil time.Duration
+	WaitUntil time.Time
 
 	// NextEval is the evaluation ID for the eval created to do a followup.
 	// This is used to support rolling upgrades, where we need a chain of evaluations.

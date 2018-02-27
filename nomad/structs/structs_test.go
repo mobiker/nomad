@@ -3053,7 +3053,7 @@ func TestAllocation_NextDelay(t *testing.T) {
 			},
 			alloc: &Allocation{
 				ClientStatus: AllocClientStatusFailed,
-				TaskStates: map[string]*TaskState{"foo": {State: "start",
+				TaskStates: map[string]*TaskState{"foo": {State: "dead",
 					StartedAt:  now.Add(-1 * time.Hour),
 					FinishedAt: now.Add(-2 * time.Second)}},
 			},
@@ -3476,7 +3476,7 @@ func TestAllocation_NextDelay(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.desc, func(t *testing.T) {
 			require := require.New(t)
-			reschedTime, allowed := tc.alloc.NextRescheduleDuration(tc.reschedulePolicy)
+			reschedTime, allowed := tc.alloc.NextRescheduleTime(tc.reschedulePolicy)
 			require.Equal(tc.expectedRescheduleEligible, allowed)
 			require.Equal(tc.expectedRescheduleTime, reschedTime)
 		})

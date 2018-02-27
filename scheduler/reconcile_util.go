@@ -228,10 +228,11 @@ func (a allocSet) filterByTainted(nodes map[string]*structs.Node) (untainted, mi
 }
 
 // filterByRescheduleable filters the allocation set to return the set of allocations that are either
-// terminal or running, and a set of allocations that must be rescheduled
-func (a allocSet) filterByRescheduleable(isBatch bool, reschedulePolicy *structs.ReschedulePolicy) (untainted, reschedule allocSet) {
+// terminal or running, and a set of allocations that must be rescheduled now. Allocations that can be rescheduled
+// at a future time are also returned so that we can create follow up evaluations for them
+func (a allocSet) filterByRescheduleable(isBatch bool, reschedulePolicy *structs.ReschedulePolicy) (untainted, rescheduleNow allocSet, rescheduleLater []*delayedRescheduleInfo) {
 	untainted = make(map[string]*structs.Allocation)
-	reschedule = make(map[string]*structs.Allocation)
+	rescheduleNow = make(map[string]*structs.Allocation)
 
 	now := time.Now()
 	for _, alloc := range a {
@@ -249,10 +250,16 @@ func (a allocSet) filterByRescheduleable(isBatch bool, reschedulePolicy *structs
 			default:
 			}
 			if alloc.NextAllocation == "" {
-				if alloc.ShouldReschedule(reschedulePolicy, now) {
-					reschedule[alloc.ID] = alloc
+				rescheduleTime, eligible := alloc.NextRescheduleTime(reschedulePolicy)
+				if eligible && now.After(rescheduleTime) {
+					rescheduleNow[alloc.ID] = alloc
 				} else {
 					untainted[alloc.ID] = alloc
+					// Add it to rescheduleLater to create follow up evals
+					/// TODO fix this logic after allocs properly store follow up eval ids
+					if eligible {
+						rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, rescheduleTime})
+					}
 				}
 			}
 		} else {
@@ -260,10 +267,14 @@ func (a allocSet) filterByRescheduleable(isBatch bool, reschedulePolicy *structs
 			if alloc.NextAllocation == "" {
 				// ignore allocs whose desired state is stop/evict
 				// everything else is either rescheduleable or untainted
-				if alloc.ShouldReschedule(reschedulePolicy, now) {
-					reschedule[alloc.ID] = alloc
+				rescheduleTime, eligible := alloc.NextRescheduleTime(reschedulePolicy)
+				if eligible && now.After(rescheduleTime) {
+					rescheduleNow[alloc.ID] = alloc
 				} else if alloc.DesiredStatus != structs.AllocDesiredStatusStop && alloc.DesiredStatus != structs.AllocDesiredStatusEvict {
 					untainted[alloc.ID] = alloc
+					if eligible {
+						rescheduleLater = append(rescheduleLater, &delayedRescheduleInfo{alloc.ID, rescheduleTime})
+					}
 				}
 			}
 		}

@@ -72,8 +72,10 @@ type GenericScheduler struct {
 	ctx        *EvalContext
 	stack      *GenericStack
 
+	// Deprecated, was used in pre Nomad 0.7 rolling update stanza
 	followupEvalWait time.Duration
 	nextEval         *structs.Evaluation
+	followUpEvals    []*structs.Evaluation
 
 	deployment *structs.Deployment
 
@@ -261,6 +263,18 @@ func (s *GenericScheduler) process() (bool, error) {
 		s.logger.Printf("[DEBUG] sched: %#v: rolling migration limit reached, next eval '%s' created", s.eval, s.nextEval.ID)
 	}
 
+	// Create follow up evals for any delayed reschedule eligible allocations
+	if len(s.followUpEvals) > 0 {
+		for _, eval := range s.followUpEvals {
+			// TODO(preetha) this should be batching evals before inserting them
+			if err := s.planner.CreateEval(eval); err != nil {
+				s.logger.Printf("[ERR] sched: %#v failed to make next eval for rescheduling: %v", s.eval, err)
+				return false, err
+			}
+			s.logger.Printf("[DEBUG] sched: %#v: found reschedulable allocs, next eval '%s' created", s.eval, eval.ID)
+		}
+	}
+
 	// Submit the plan and store the results.
 	result, newState, err := s.planner.SubmitPlan(s.plan)
 	s.planResult = result
@@ -336,6 +350,12 @@ func (s *GenericScheduler) computeJobAllocs() error {
 	// follow up eval to handle node draining.
 	s.followupEvalWait = results.followupEvalWait
 
+	// Store all the follow up evaluations from rescheduled allocations
+	if len(results.desiredFollowupEvals) > 0 {
+		for _, evals := range results.desiredFollowupEvals {
+			s.followUpEvals = append(s.followUpEvals, evals...)
+		}
+	}
 	// Update the stored deployment
 	if results.deployment != nil {
 		s.deployment = results.deployment
