@@ -487,7 +487,7 @@ func (s *GenericScheduler) computePlacements(destructive, place []placementResul
 				if prevAllocation != nil {
 					alloc.PreviousAllocation = prevAllocation.ID
 					if missing.IsRescheduling() {
-						updateRescheduleTracker(alloc, prevAllocation)
+						updateRescheduleTracker(alloc, prevAllocation, tg.ReschedulePolicy)
 					}
 				}
 
@@ -543,15 +543,42 @@ func getSelectOptions(prevAllocation *structs.Allocation, preferredNode *structs
 	return selectOptions
 }
 
+const max_past_reschedule_events = 5
+
 // updateRescheduleTracker carries over previous restart attempts and adds the most recent restart
-func updateRescheduleTracker(alloc *structs.Allocation, prev *structs.Allocation) {
+func updateRescheduleTracker(alloc *structs.Allocation, prev *structs.Allocation, reschedPolicy *structs.ReschedulePolicy) {
 	var rescheduleEvents []*structs.RescheduleEvent
 	if prev.RescheduleTracker != nil {
-		for _, reschedEvent := range prev.RescheduleTracker.Events {
-			rescheduleEvents = append(rescheduleEvents, reschedEvent.Copy())
+		var interval time.Duration
+		if reschedPolicy != nil {
+			interval = reschedPolicy.Interval
+		}
+		// if attempts is set copy all events in the interval range
+		if reschedPolicy.Attempts > 0 {
+			for _, reschedEvent := range prev.RescheduleTracker.Events {
+				timeDiff := time.Now().UTC().UnixNano() - reschedEvent.RescheduleTime
+				// Only copy over events that are within restart interval
+				// This keeps the list of events small in cases where there's a long chain of old restart events
+				if interval > 0 && timeDiff <= interval.Nanoseconds() {
+					rescheduleEvents = append(rescheduleEvents, reschedEvent.Copy())
+				}
+			}
+		} else {
+			// for unlimited restarts, only copy the last n
+			copied := 0
+			for i := len(prev.RescheduleTracker.Events) - 1; i > 0 && copied < max_past_reschedule_events; i-- {
+				reschedEvent := prev.RescheduleTracker.Events[i]
+				rescheduleEvents = append(rescheduleEvents, reschedEvent.Copy())
+				copied++
+			}
+			// reverse it to get the correct order
+			for left, right := 0, len(rescheduleEvents)-1; left < right; left, right = left+1, right-1 {
+				rescheduleEvents[left], rescheduleEvents[right] = rescheduleEvents[right], rescheduleEvents[left]
+			}
 		}
 	}
-	rescheduleEvent := structs.NewRescheduleEvent(time.Now().UTC().UnixNano(), prev.ID, prev.NodeID)
+	nextDelay := prev.NextDelay(reschedPolicy)
+	rescheduleEvent := structs.NewRescheduleEvent(time.Now().UTC().UnixNano(), prev.ID, prev.NodeID, nextDelay)
 	rescheduleEvents = append(rescheduleEvents, rescheduleEvent)
 	alloc.RescheduleTracker = &structs.RescheduleTracker{Events: rescheduleEvents}
 }

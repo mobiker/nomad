@@ -5126,10 +5126,11 @@ type RescheduleEvent struct {
 	Delay time.Duration
 }
 
-func NewRescheduleEvent(rescheduleTime int64, prevAllocID string, prevNodeID string) *RescheduleEvent {
+func NewRescheduleEvent(rescheduleTime int64, prevAllocID string, prevNodeID string, delay time.Duration) *RescheduleEvent {
 	return &RescheduleEvent{RescheduleTime: rescheduleTime,
 		PrevAllocID: prevAllocID,
-		PrevNodeID:  prevNodeID}
+		PrevNodeID:  prevNodeID,
+		Delay:       delay}
 }
 
 func (re *RescheduleEvent) Copy() *RescheduleEvent {
