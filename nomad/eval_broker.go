@@ -8,8 +8,11 @@ import (
 	"sync"
 	"time"
 
+	"context"
+
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/nomad/helper/uuid"
+	"github.com/hashicorp/nomad/nomad/delayheap"
 	"github.com/hashicorp/nomad/nomad/structs"
 )
 
@@ -77,6 +80,14 @@ type EvalBroker struct {
 	// timeWait has evaluations that are waiting for time to elapse
 	timeWait map[string]*time.Timer
 
+	// delayedEvalCancelFunc is used to stop the long running go routine
+	// that processes delayed evaluations
+	delayedEvalCancelFunc context.CancelFunc
+
+	// delayHeap is a heap used to track incoming evaluations that are
+	// not eligible to enqueue until their WaitTime
+	delayHeap *delayheap.DelayHeap
+
 	// initialNackDelay is the delay applied before reenqueuing a
 	// Nacked evaluation for the first time.
 	initialNackDelay time.Duration
@@ -127,8 +138,12 @@ func NewEvalBroker(timeout, initialNackDelay, subsequentNackDelay time.Duration,
 		timeWait:            make(map[string]*time.Timer),
 		initialNackDelay:    initialNackDelay,
 		subsequentNackDelay: subsequentNackDelay,
+		delayHeap:           delayheap.NewDelayHeap(),
 	}
 	b.stats.ByScheduler = make(map[string]*SchedulerStats)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.delayedEvalCancelFunc = cancel
+	go b.runDelayedEvalsWatcher(ctx)
 	return b, nil
 }
 
@@ -203,6 +218,11 @@ func (b *EvalBroker) processEnqueue(eval *structs.Evaluation, token string) {
 	// Check if we need to enforce a wait
 	if eval.Wait > 0 {
 		b.processWaitingEnqueue(eval)
+		return
+	}
+
+	if !eval.WaitUntil.IsZero() {
+		b.delayHeap.Push(&evalWrapper{eval}, eval.WaitUntil)
 		return
 	}
 
@@ -663,6 +683,9 @@ func (b *EvalBroker) Flush() {
 		wait.Stop()
 	}
 
+	// Cancel the delayed evaluations goroutine
+	b.delayedEvalCancelFunc()
+
 	// Reset the broker
 	b.stats.TotalReady = 0
 	b.stats.TotalUnacked = 0
@@ -675,6 +698,60 @@ func (b *EvalBroker) Flush() {
 	b.ready = make(map[string]PendingEvaluations)
 	b.unack = make(map[string]*unackEval)
 	b.timeWait = make(map[string]*time.Timer)
+	b.delayHeap = delayheap.NewDelayHeap()
+}
+
+// evalWrapper satisfies the HeapNode interface
+type evalWrapper struct {
+	eval *structs.Evaluation
+}
+
+func (d *evalWrapper) Data() interface{} {
+	return d.eval
+}
+
+func (d *evalWrapper) ID() string {
+	return d.eval.ID
+}
+
+func (d *evalWrapper) Namespace() string {
+	return d.eval.Namespace
+}
+
+// runDelayedEvalsWatcher is a long-lived function that waits till a job's periodic spec is met and
+// then creates an evaluation to run the job.
+func (b *EvalBroker) runDelayedEvalsWatcher(ctx context.Context) {
+	var timerChannel <-chan time.Time
+	for b.enabled {
+		eval, waitUntil := b.nextDelayedEval()
+		if waitUntil.IsZero() {
+			timerChannel = nil
+		} else {
+			launchDur := waitUntil.Sub(time.Now().UTC())
+			timerChannel = time.After(launchDur)
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-timerChannel:
+			b.enqueueLocked(eval, eval.Type)
+		}
+	}
+}
+
+// nextDelayedEval returns the next delayed eval to launch and when it should be enqueued.
+func (b *EvalBroker) nextDelayedEval() (*structs.Evaluation, time.Time) {
+	// If there is nothing wait for an update.
+	if b.delayHeap.Length() == 0 {
+		return nil, time.Time{}
+	}
+	nextEval := b.delayHeap.Pop()
+	if nextEval == nil {
+		return nil, time.Time{}
+	}
+	eval := nextEval.Node.Data().(*structs.Evaluation)
+	return eval, nextEval.WaitUntil
 }
 
 // Stats is used to query the state of the broker
